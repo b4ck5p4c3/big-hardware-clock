@@ -11,7 +11,7 @@
 #include "config.h"
 
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "time.0x08.in");
+NTPClient timeClient(ntpUDP, "0.ntp.bksp.in");
 
 void updateTime() {
     struct timeval new_time;
