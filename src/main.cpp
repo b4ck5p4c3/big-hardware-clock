@@ -29,7 +29,7 @@ IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDns(10, 0, 2, 1);
 
 // https://github.com/skeeto/hash-prospector with [16 21f0aaad 15 735a2d97 15] = 0.10704308166917044
-uint32_t lowbias32(uint32_t x) {
+static uint32_t lowbias32(uint32_t x) {
   x ^= x >> 16;
   x *= UINT32_C(0x21f0aaad);
   x ^= x >> 15;
@@ -38,7 +38,7 @@ uint32_t lowbias32(uint32_t x) {
   return x;
 }
 
-uint32_t hashSeed;
+static uint32_t hashSeed;
 
 static void randomSeed(void) {
   unsigned long r = random(LONG_MAX); // in case if it's already seeded
@@ -124,11 +124,17 @@ void setup() {
     }
 }
 
-// first:
-// abcdefgD
-// gcbafedD
-// 76543210
-
+// Each digit is a bitmask for a 7-segment indicator
+// with the following bits in 0b786543210 byte:
+//      7
+//   +-----+
+//  2|     |6
+//   |  1  |
+//   +-----*
+//  3|     |5
+//   |  4  |
+//   +-----*
+// The last bit is a "dot" delimiter on the clock panel.
 byte digits[10] = {
     0b11111100,
     0b01100000,
@@ -166,7 +172,7 @@ byte transformSegments(byte b) {
     return b;
 }
 
-void writeAll(byte* data, byte dot_a, byte dot_b) {
+void writeAll(const byte* data, byte dot_a, byte dot_b) {
     digitalWrite(LATCH_PIN, LOW);
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, transformSegments(data[2]) | (kDots & dot_a));
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, transformSegments(data[1]));
