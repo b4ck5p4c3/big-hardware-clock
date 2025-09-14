@@ -103,8 +103,6 @@ void setup() {
     }
 }
 
-byte a = 1;
-
 // first:
 // abcdefgD
 // gcbafedD
@@ -158,8 +156,6 @@ void writeAll(byte* data, byte dot_a, byte dot_b) {
     digitalWrite(LATCH_PIN, HIGH);
 }
 
-unsigned long long value = 0;
-
 void loop() {
     ArduinoOTA.handle();
     
@@ -168,21 +164,22 @@ void loop() {
         updateTime();
     }
 
-    time_t current_time;
-    time(&current_time);
-    struct tm timeinfo;
-    localtime_r(&current_time, &timeinfo);
-    current[0] = alphabet[timeinfo.tm_hour / 10];
-    current[1] = alphabet[timeinfo.tm_hour % 10];
-    current[2] = alphabet[timeinfo.tm_min / 10];
-    current[3] = alphabet[timeinfo.tm_min % 10];
-    current[4] = alphabet[timeinfo.tm_sec / 10];
-    current[5] = alphabet[timeinfo.tm_sec % 10];
+    unsigned long nowMillis;
+    unsigned long epochTime = timeClient.getEpochTime(&nowMillis);
+    unsigned long timeOfDay = epochTime % 86400;
+    unsigned hour = timeOfDay / 3600;
+    unsigned min = (timeOfDay % 3600) / 60;
+    unsigned sec = (timeOfDay % 3600) % 60;
 
-    struct timeval current_time_v;
-    gettimeofday(&current_time_v, NULL);
+    current[0] = alphabet[hour / 10];
+    current[1] = alphabet[hour % 10];
+    current[2] = alphabet[min / 10];
+    current[3] = alphabet[min % 10];
+    current[4] = alphabet[sec / 10];
+    current[5] = alphabet[sec % 10];
+
     bool dots = true;
-    if (current_time_v.tv_usec / 1000 % 1000 > 500) {
+    if (nowMillis > 500) {
         dots = false;
     }
     writeAll(current, dots, dots);
