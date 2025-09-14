@@ -15,8 +15,9 @@ NTPClient timeClient(ntpUDP, "0.ntp.bksp.in");
 
 void updateTime() {
     struct timeval new_time;
-    new_time.tv_usec = 0;
-    new_time.tv_sec = timeClient.getEpochTime();
+    unsigned long nowMillis;
+    new_time.tv_sec = timeClient.getEpochTime(&nowMillis);
+    new_time.tv_usec = nowMillis * 1000;
     Serial.print("New time: ");
     Serial.println(new_time.tv_sec);
     settimeofday(&new_time, NULL);
@@ -91,11 +92,10 @@ void setup() {
 
     timeClient.begin();
     timeClient.setTimeOffset(3 * 3600);
-    timeClient.setUpdateInterval(3600 * 1000);
 
     Serial.println("Starting time");
     
-    if (!timeClient.forceUpdate()) {
+    if (!timeClient.update()) {
         Serial.println("Failed to update time");
     } else {
         Serial.println("Updating time");
