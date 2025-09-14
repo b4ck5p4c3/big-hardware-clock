@@ -177,6 +177,13 @@ void writeAll(byte* data, byte dot_a, byte dot_b) {
     digitalWrite(LATCH_PIN, HIGH);
 }
 
+void writeNone(void) {
+    digitalWrite(LATCH_PIN, LOW);
+    for (int i = 0; i < 6; ++i)
+      shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0);
+    digitalWrite(LATCH_PIN, HIGH);
+}
+
 uint32_t lastTimeHashInput = 0;
 uint8_t lastDots = 0;
 
@@ -218,5 +225,9 @@ void loop() {
         }
       }
     }
-    writeAll(current, lastDots & 1, lastDots >> 1);
+
+    if (!(nowMillis & 4)) // poor-man PWM
+      writeAll(current, lastDots & 1, lastDots >> 1);
+    else
+      writeNone();
 }
