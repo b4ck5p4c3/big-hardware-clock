@@ -108,7 +108,7 @@ void setup() {
 // gcbafedD
 // 76543210
 
-byte alphabet[10] = {
+byte digits[10] = {
     0b11111100,
     0b01100000,
     0b11011010,
@@ -171,12 +171,12 @@ void loop() {
     unsigned min = (timeOfDay % 3600) / 60;
     unsigned sec = (timeOfDay % 3600) % 60;
 
-    current[0] = alphabet[hour / 10];
-    current[1] = alphabet[hour % 10];
-    current[2] = alphabet[min / 10];
-    current[3] = alphabet[min % 10];
-    current[4] = alphabet[sec / 10];
-    current[5] = alphabet[sec % 10];
+    current[0] = digits[hour / 10];
+    current[1] = digits[hour % 10];
+    current[2] = digits[min / 10];
+    current[3] = digits[min % 10];
+    current[4] = digits[sec / 10];
+    current[5] = digits[sec % 10];
 
     bool dots = true;
     if (nowMillis > 500) {
