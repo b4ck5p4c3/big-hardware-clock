@@ -28,9 +28,30 @@ IPAddress gateway(10, 0, 2, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDns(10, 0, 2, 1);
 
+// https://github.com/skeeto/hash-prospector with [16 21f0aaad 15 735a2d97 15] = 0.10704308166917044
+uint32_t lowbias32(uint32_t x) {
+  x ^= x >> 16;
+  x *= UINT32_C(0x21f0aaad);
+  x ^= x >> 15;
+  x *= UINT32_C(0x735a2d97);
+  x ^= x >> 15;
+  return x;
+}
+
+uint32_t hashSeed;
+
+static void randomSeed(void) {
+  unsigned long r = random(LONG_MAX); // in case if it's already seeded
+  for (int i = 0; i < sizeof(r) * 8; i++)
+    r ^= ((unsigned long)analogRead(0)) << i; // analogRead() is just 10..12 bits
+  randomSeed(r);
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println("Booting");
+    randomSeed();
+    hashSeed = random(UINT32_MAX);
     WiFi.mode(WIFI_MODE_STA);
     if (!WiFi.config(localIp, gateway, subnet, primaryDns)) {
         Serial.println("STA Failed to configure");
@@ -156,6 +177,9 @@ void writeAll(byte* data, byte dot_a, byte dot_b) {
     digitalWrite(LATCH_PIN, HIGH);
 }
 
+uint32_t lastTimeHashInput = 0;
+uint8_t lastDots = 0;
+
 void loop() {
     ArduinoOTA.handle();
     
@@ -178,9 +202,16 @@ void loop() {
     current[4] = digits[sec / 10];
     current[5] = digits[sec % 10];
 
-    bool dots = true;
-    if (nowMillis > 500) {
-        dots = false;
+    const uint32_t hashInput = (timeOfDay << 1) | (nowMillis >= 500 ? 1 : 0);
+    if (hashInput != lastTimeHashInput) {
+      for (uint32_t i = 0; i < 4096; i++) {
+        uint8_t maybe = 3 & lowbias32(hashSeed ^ hashInput ^ (i << 20));
+        if (maybe != lastDots) {
+          lastTimeHashInput = hashInput;
+          lastDots = maybe;
+          break;
+        }
+      }
     }
-    writeAll(current, dots, dots);
+    writeAll(current, lastDots & 1, lastDots >> 1);
 }
