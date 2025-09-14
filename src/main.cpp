@@ -205,7 +205,12 @@ void loop() {
     const uint32_t hashInput = (timeOfDay << 1) | (nowMillis >= 500 ? 1 : 0);
     if (hashInput != lastTimeHashInput) {
       for (uint32_t i = 0; i < 4096; i++) {
-        uint8_t maybe = 3 & lowbias32(hashSeed ^ hashInput ^ (i << 20));
+        uint32_t hash = lowbias32(hashSeed ^ hashInput ^ (i << 20));
+        hash ^= hash >> 16;
+        hash ^= hash >> 8;
+        hash ^= hash >> 4;
+        hash ^= hash >> 2;
+        uint8_t maybe = 3 & hash;
         if (maybe != lastDots) {
           lastTimeHashInput = hashInput;
           lastDots = maybe;
