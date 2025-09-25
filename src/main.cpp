@@ -61,7 +61,7 @@ void updateTime() {
 
 IPAddress localIp(10, 0, 2, 105);
 IPAddress gateway(10, 0, 2, 1);
-IPAddress subnet(255, 255, 255, 0);
+IPAddress subnet(255, 255, 254, 0);
 IPAddress primaryDns(10, 0, 2, 1);
 
 // https://github.com/skeeto/hash-prospector with [16 21f0aaad 15 735a2d97 15] = 0.10704308166917044
