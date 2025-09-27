@@ -3,6 +3,9 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <hal/wdt_types.h>
+#include <hal/wdt_hal.h>
+#include <soc/rtc.h>
 
 #define LATCH_PIN 19
 #define CLOCK_PIN 18
@@ -39,15 +42,48 @@ static const byte kMsgUpdone[6] = {
 };
 
 static void writeAll(const byte* data, byte dot_a, byte dot_b);
+static void writeNone(void);
+static void watchdogFeed(void);
+
 static void writeNSleep(const byte *data, unsigned char ndx) {
+  watchdogFeed();
   writeAll(data, ndx & 1, (ndx >> 1) & 1);
   delay(250);
 }
+
 static void writeErr(const byte *data) { writeNSleep(data, 3); }
-static void writeNone(void);
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "0.ntp.bksp.in");
+wdt_hal_context_t watchdogCtx;
+
+static void watchdogSetup(void) {
+  wdt_hal_init(&watchdogCtx, WDT_RWDT, 0, false);
+  const uint32_t timeoutSeconds = 16; // Default Arduino CONFIG_BOOTLOADER_WDT_TIME_MS is 9000
+  const uint32_t timeoutTicks = timeoutSeconds * rtc_clk_slow_freq_get_hz();
+  wdt_hal_write_protect_disable(&watchdogCtx);
+  wdt_hal_config_stage(&watchdogCtx, WDT_STAGE0, timeoutTicks, WDT_STAGE_ACTION_RESET_RTC);
+  wdt_hal_enable(&watchdogCtx);
+  wdt_hal_write_protect_enable(&watchdogCtx);
+}
+
+static void watchdogEnable(void) {
+  wdt_hal_write_protect_disable(&watchdogCtx);
+  wdt_hal_enable(&watchdogCtx);
+  wdt_hal_write_protect_enable(&watchdogCtx);
+}
+
+static void watchdogDisable(void) {
+  wdt_hal_write_protect_disable(&watchdogCtx);
+  wdt_hal_disable(&watchdogCtx);
+  wdt_hal_write_protect_enable(&watchdogCtx);
+}
+
+static void watchdogFeed(void) {
+  wdt_hal_write_protect_disable(&watchdogCtx);
+  wdt_hal_feed(&watchdogCtx);
+  wdt_hal_write_protect_enable(&watchdogCtx);
+}
 
 void updateTime() {
     struct timeval new_time;
@@ -90,6 +126,7 @@ static void displaySetup() {
 }
 
 void setup() {
+    watchdogSetup();
     Serial.begin(115200);
     Serial.println("Booting");
     randomSeed();
@@ -118,6 +155,7 @@ void setup() {
     writeNSleep(kMsg_Boot_, 1);
     ArduinoOTA
         .onStart([]() {
+            watchdogDisable();
             writeErr(kMsgUpdate);
             if (ArduinoOTA.getCommand() == U_FLASH) {
                 Serial.println("Start updating sketch"); 
@@ -125,7 +163,8 @@ void setup() {
                 Serial.println("Start updating fs"); 
             }
         })
-        .onEnd([]() { 
+        .onEnd([]() {
+            watchdogEnable();
             writeErr(kMsgUpdone);
             Serial.println("\nEnd"); 
         })
@@ -251,6 +290,7 @@ uint32_t lastTimeHashInput = 0;
 uint8_t lastDots = 0;
 
 void loop() {
+    watchdogFeed();
     ArduinoOTA.handle();
 
     if (timeClient.update()) {
