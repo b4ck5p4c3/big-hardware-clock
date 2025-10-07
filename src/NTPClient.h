@@ -1,139 +1,139 @@
 #pragma once
 
-#include "Arduino.h"
-
+#include <Arduino.h>
 #include <Udp.h>
 
-#ifndef ARDUINO_NTP_SERVER
-// The NTP pool is a shared resource provided by the NTP Pool Project[POOL] and used by people
-// and services all over the world. To prevent it from becoming overloaded, please avoid querying
-// the standard `pool.ntp.org` zone names in your applications. Instead, consider requesting your
-// own vendor zone[ZONE] and/or joining the pool[POOL].
-//
-// [POOL] https://www.ntppool.org/en/
-// [ZONE] https://www.ntppool.org/en/vendors.html
-// [POOL] https://www.ntppool.org/join.html
-#warning Look at www.ntppool.org/en/vendors.html before using "pool.ntp.org".
-#define ARDUINO_NTP_SERVER "pool.ntp.org"
-#endif
+/* That's SNTPv4 client supporting the following features:
+ *  - NTP Client Data Minimization per draft-ietf-ntp-data-minimization-04
+ *  - Port randomization per RFC 6056 and RFC 9109
+ *  - MINPOLL of 11 (30 minutes) for ntppool per https://www.ntppool.org/tos.html
+ *  - Server IP caching to reduce jitter and measure true NTP Delay (T4-T1) without DNS query RTT
+ *  - Incoming packet validation (NTPClient-3.2.1 did not validate input)
+ *  - Non-blocking network operation without delay() calls
+ *  - Sub-second precision to make Arduino-based clocks "tick" synchronously
+ */
 
-#ifndef ARDUINO_NTP_MINPOLL
-// NTP Pool Terms of Service
-// 4. End-User agrees that he or she will not:
-// (b) Request time from the Services more than once every thirty (30) minutes [...], if using SNTP.
-// -- https://www.ntppool.org/tos.html
-#define ARDUINO_NTP_MINPOLL 11 // 34m8s
-#endif
-
-#ifndef ARDUINO_NTP_REJECTD_CACHE
-#define ARDUINO_NTP_REJECTD_CACHE 4 // number of `A` replies for pool.ntp.org
-#endif
-
-#define DEFPOLL 6 // 64s for compatibility with NTPClient-3.2.x
-
-class NTPClock {
-  private:
-    unsigned long _refUnix;   // unsigned 32-bit time_t is okay till 2106
-    unsigned long _refMillis; // adjusted to align with the start of _refUnix second
-  public:
-    NTPClock() : _refUnix(0), _refMillis(0) {}
-    bool isSet(void) const { return _refUnix != 0; }
-    void set(unsigned long unix, unsigned long millis) {
-      _refUnix = unix;
-      _refMillis = millis;
-    }
-    int offset(unsigned long unix, unsigned long millis) const {
-      // (dtSec * 1000UL) overflow (49 days) still produces correct offset as millis() wrap
-      const unsigned long dtSec = unix - _refUnix;
-      const unsigned long localMillis = _refMillis + (dtSec * 1000UL);
-      const long offsetLong = (long)(millis - localMillis);
-      return offsetLong > INT_MAX   ? INT_MAX
-             : offsetLong < INT_MIN ? INT_MIN
-                                    : offsetLong;
-    }
-    unsigned long getEpochTime(unsigned long *pMillis) const {
-      const unsigned long now = millis();
-      const unsigned long dtMillis = now - _refMillis;
-      const unsigned long dtSec = dtMillis / 1000;
-      if (pMillis)
-        *pMillis = dtMillis % 1000;
-      return _refUnix + dtSec;
-    }
+// Some platforms (e.g. ESP32) have sys/time.h and struct timeval, and some don't (e.g. ATmega328).
+#ifdef HAVE_STRUCT_TIMEVAL
+struct timeval;
+typedef struct timeval NTPTimeval;
+#else
+struct NTPTimeval {
+  unsigned long tv_sec;
+  unsigned long tv_usec;
 };
+#endif
 
 class NTPClient {
   private:
-    UDP*          _udp;
-    const char*   _serverName;
-    IPAddress     _serverIP; // cached till KoD or timeout
-    NTPClock      _clock;
+    static const unsigned NSTAGE = 8; // clock register stages
+
+    UDP&          _udp;
+
+    const char*   _poolServerName = "pool.ntp.org"; // Default time server
+    IPAddress     _poolServerIP;
+    long          _timeOffset     = 0;
+
+    // _lastMicros corrsespong to _lastUnix.00000000, not to _lastUnix._lastUnixLFP16
+    // _lastUnixLFP16 is used for extra precision in `mu` calculation.
+    int64_t       _lastMicros;
+    uint32_t      _lastUnix;
+    uint16_t      _lastUnixLFP16;
+    double        _lastOffset;
     double        _clockJitter;
-    unsigned long _lastPollMillis;
+    double        _freq;
+#ifdef NTPCLIENT_SYSLOG
+    double        _wander;
+#endif
+    int8_t        _jiggleCount;
+    uint8_t       _reach;
+
+    struct Sample {
+      uint32_t unixHigh;       // It does not matter much if it's NTP or Unix. That's unix.
+      uint16_t unixLFP16;      // 16 high bits of 32-bit LFP. That's fine given S_PRECISION.
+      uint16_t delayMicros16;  // This machine speaks micros(), that's count of 32us steps.
+      double   offset;         // Offsets beyond ±125ms (STEPT) are either IGNORE'd or lead to STEP.
+    };
+    Sample        _filter[NSTAGE];
+
+    union {
+      uint16_t      _xmt16[4];        // not T1, but a random cookie
+      unsigned long _nextPollMillis;  // invalid while _waitingForReply
+    };
+    unsigned long _t1;
+    uint16_t      _port;
     unsigned char _pollExponent;
-    unsigned char _reach;    // 8-bit integer shift register
-    unsigned char _unreach;  // unreach counter
-    signed char   _jiggle;   // jiggle counter
-    int           _lastOffsetMillis; // [-32s; +32s]
+    bool          _keepPortOnNewIP : 1;
+    bool          _udpSetup        : 1;
+    bool          _doResolve       : 1;
+    bool          _waitingForReply : 1;
+    unsigned char _clockState      : 3;
+    unsigned char _filterNextIndex : 3;
 
-    unsigned short _srcPort;
-    unsigned char  _flags;
-    static const unsigned char _confSrcPort = 1U << 0; // user set port explicitly
-    static const unsigned char _udpSetup = 1U << 1;
-    static const unsigned char _tryDNS = 1U << 2;
-    static const unsigned char _firstPollDone = 1U << 3;
-
-    // As of 2025, there are UTC offsets ranging from -12h00m to +14h00m with granularity of 15m.
-    // Other granularities are legacy, so storing offset as a number of 15m intervals is okay while
-    // saving some memory.
-    signed char   _QHourOffset;
-
-    unsigned char ntppoolExponent(unsigned char pollExponent) const;
-    void          resetNtpPoll(unsigned char pollExponent);
-    unsigned long sendNTPPacket(const unsigned char xmt[8]);
-    void          unreachPollInterval(void);
-    void          jigglePollInterval(int offsetMillis);
-    void          ingestGoodTime(unsigned char *pkt, unsigned long t1, unsigned long t4);
-    bool          isTimeToPoll(void) const;
+    unsigned long nextPollInterval() const;
+    void          scheduleNextPoll();
+    void          ctor(long timeOffset);
+    void          clearAssociation();
+    bool          sendRequest();
+    bool          checkForReply();
+    void          sendNTPPacket(const unsigned char xmt[8]);
+    bool          isPollingNtppool(void) const;
+    unsigned char minpoll(void) const;
+    const Sample* bestSample(void) const;
+    double        peerJitter(const Sample* best) const;
+    uint64_t      unixLFPAt(uint64_t micros) const;
+    int64_t       freqErr(int64_t micros) const;
+    bool          clockFilter(uint64_t unix, double offset, uint32_t delayMicros);
+    bool          clockUpdate(uint64_t unixLFP, double offset);
+    unsigned char localClock(uint64_t unixLFP, double offset);
+    void          step_time(double offset);
+    void          rstclock(unsigned char clockState, uint64_t unixHigh, double offset);
 
   public:
-    static const unsigned long poolInterval = 1000UL * (1UL << ARDUINO_NTP_MINPOLL);
-    static const unsigned long nonpoolInterval = 1000UL * (1UL << DEFPOLL);
-
-    NTPClient(UDP &udp, long timeOffset = 0);
-    NTPClient(UDP &udp, const char *serverName, long timeOffset = 0,
-              unsigned long updateInterval = nonpoolInterval);
-    NTPClient(UDP &udp, IPAddress serverIP, long timeOffset = 0,
-              unsigned long updateInterval = nonpoolInterval);
+    NTPClient(UDP& udp, long timeOffset = 0);
+    NTPClient(UDP& udp, const char* poolServerName, long timeOffset = 0, unsigned long updateInterval = 60000);
+    NTPClient(UDP& udp, IPAddress poolServerIP, long timeOffset = 0, unsigned long updateInterval = 60000);
 
     /**
      * Set time server name
      *
-     * @param serverName
+     * @param poolServerName
      */
-    void setPoolServerName(const char* serverName);
+    void setPoolServerName(const char* poolServerName);
 
      /**
      * Set random local port
      */
-    void setRandomPort(unsigned int minValue = 49152, unsigned int maxValue = 65535);
+    void setRandomPort(unsigned int minValue = 1024, unsigned int maxValue = 65535);
 
     /**
-     * Starts the underlying UDP client with the specified local port. Port 0 uses default value.
-     *
-     * @return 1 if successful, 0 if there are no sockets available to use
+     * Starts the underlying UDP client with the default local port
      */
-    int begin(unsigned int port = 0);
+    void begin();
 
     /**
-     * This should be called in the main loop of your application. By default an update from the NTP Server is only
-     * made every 60 seconds. This can be configured in the NTPClient constructor.
+     * Starts the underlying UDP client with the specified local port
+     */
+    void begin(unsigned int port);
+
+    /**
+     * This should be called on every main loop iteration of your application
+     * to keep NTP-based clock up-to-date while avoiding delay() in loop().
+     *
+     * @return true when clock got update via NTP, false otherwise
+     */
+    bool maintain();
+
+    /**
+     * This might be called in the main loop of your application.  It checks if it's time to query
+     * NTP server, polls it as needed and updates clock.  It blocks the loop().
      *
      * @return true on success, false on failure
      */
     bool update();
 
     /**
-     * This will force the update from the NTP Server.
+     * This will force the update from the NTP Server.  It blocks the loop().
      *
      * @return true on success, false on failure
      */
@@ -145,6 +145,20 @@ class NTPClient {
      * @return true if time has been set, else false
      */
     bool isTimeSet() const;
+
+    bool isTimeSync() const;
+    uint8_t getPollExponent(void) const {
+      return _pollExponent;
+    }
+    double getClockJitter(void) const {
+      return _clockJitter;
+    }
+    double getClockFreq(void) const {
+      return _freq;
+    }
+    double getClockWander(void) const {
+      return _wander;
+    }
 
     int getDay() const;
     int getHours() const;
@@ -170,7 +184,14 @@ class NTPClient {
     /**
      * @return time in seconds since Jan. 1, 1970
      */
-    unsigned long getEpochTime(unsigned long *pMillis = 0) const;
+    unsigned long getEpochTime() const;
+
+    /**
+     * Fills *tv with time in seconds and micros since Jan. 1, 1970
+     *
+     * @return true if time has been set, else false
+     */
+    bool getTimeOfDay(NTPTimeval *tv) const;
 
     /**
      * Stops the underlying UDP client

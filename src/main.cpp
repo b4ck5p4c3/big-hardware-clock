@@ -87,9 +87,7 @@ static void watchdogFeed(void) {
 
 void updateTime() {
     struct timeval new_time;
-    unsigned long nowMillis;
-    new_time.tv_sec = timeClient.getEpochTime(&nowMillis);
-    new_time.tv_usec = nowMillis * 1000;
+    timeClient.getTimeOfDay(&new_time);
     Serial.print("New time: ");
     Serial.println(new_time.tv_sec);
     settimeofday(&new_time, NULL);
@@ -301,7 +299,7 @@ void loop() {
         return;
 
     unsigned long nowMillis;
-    unsigned long epochTime = timeClient.getEpochTime(&nowMillis);
+    unsigned long epochTime = timeClient.getEpochTime();
     unsigned long timeOfDay = epochTime % 86400;
     unsigned hour = timeOfDay / 3600;
     unsigned min = (timeOfDay % 3600) / 60;

@@ -20,45 +20,153 @@
  */
 
 #include "NTPClient.h"
+#include <math.h>
+#include <limits.h>
 
-#define PORT 123
-#define ROOTDELAY_OFFSET 4
-#define ROOTDISP_OFFSET 8
+#define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
+#define ARRAY_END(x) (x + ARRAY_LEN(x))
+#define PRINT(x) do { Serial.print( #x ": " ); Serial.println(x); } while (0)
+#define PRINT2(x, fmt) do { Serial.print( #x ": " ); Serial.println((x), fmt); } while (0)
+
+// System Precision is (-16) as an upper bound for the following values:
+//   - 8us stands for -16.93, that's precision of Arduino Lilypad micros()
+//   - 8.62us stands for -16.82, that's precision of lfplo2us() and us2lfplo()
+//   - -17 stands for 7.63us, that's -16.93 rounded
+#define S_PRECISION (-16)
+#define S_PRECISIONMICROS 9
+
+// Resolution of micros() is 2 on ATmega328p, precision (in NTP sense) 4.  Timeout of 2s (BTIME)
+// needs 21 bit to be represented in micros, but 32us granularity is fine for delay measurement.
+#define MICROS16_SHR 5
+
+#define LOG2D(a) ((a) < 0 ? 1. / (1L << -(a)) : 1L << (a)) // poll, etc.
+
+static const uint8_t VerModeMask = 0b00111111;
+static const uint8_t Ver4Client = 0b00100011;
+static const uint8_t Ver4Server = 0b00100100;
+
+struct NtpPacket {
+  uint8_t LeapVerMode;
+  uint8_t Stratum;
+  uint8_t Poll;
+  uint8_t Precision;
+  uint32_t RootDelay;
+  uint32_t RootDispersion;
+  uint32_t RefID;
+  uint64_t RefTime;
+  uint64_t Org;
+  uint64_t Rec;
+  uint64_t Xmt;
+
+  uint8_t VerMode() const { return LeapVerMode & VerModeMask; }
+  uint8_t Leap() const { return (LeapVerMode >> 6) & 3; }
+  uint32_t RootDistFP() const;  // not root_dist()
+};
 #define REF_OFFSET 16
 #define ORG_OFFSET 24
 #define REC_OFFSET 32
 #define XMT_OFFSET 40
 #define NTP_PACKET_SIZE 48
-#define NTP_TIMEOUT_MS 1000
+static_assert(sizeof(NtpPacket) == NTP_PACKET_SIZE);
 
+// This SNTP implementation always steps, so `c.offset`, aka "current offset" is always zero.
+// Note, it's different from `c.last`, "previous offset".
+static const double clockOffset = 0;
+static const double FRAC = 4294967296.;  // 2^32 as a double
+
+#define PORT 123        // NTP port number
+#define BTIME 2         // burst interval (s), also default guard interval
+#define MINDISP .01     // % minimum dispersion (s) // FIXME: or 0.005 ?
+#define MAXDISP 16      // maximum dispersion (s)
+#define MAXDIST 1       // % distance threshold (s)
+#define NOSYNC 0x3      // leap unsync
+#define KODSTRAT 0      // Stratum=0 are called Kiss-o'-Death (KoD) packets
+#define MAXSTRAT 16     // maximum stratum number
+#define MAXPOLL 17      // 36h, maximum poll exponent
+#define MINPOLL_NTP 4   // 16s, minimum poll exponent for NTPv4, RFC5905
+#define MINPOLL_SNTP 6  // 64s, minimum poll exponent for SNTPv4, RFC4330 Section 5
+
+
+static const uint32_t MaxDispersionFP = UINT32_C(MAXDISP) << 16;
+
+// Local clock process return codes
+#define IGNORE 0  // ignore
+#define SLEW 1    // slew adjustment
+#define STEP 2    // step adjustment
+#define PANIC 3   // panic - no adjustment
+
+// Clock state definitions
+#define NCLK 0 // no RTC clock to bootstrap from, 1st stample moves from NCLK to NSET|FSET
+#define NSET 1 // clock never set
+#define FSET 2 // frequency set from file
+#define SPIK 3 // spike detected
+#define FREQ 4 // frequency (measurement) mode
+#define SYNC 5 // clock synchronized
+
+// NTPv3 defines CLOCK.MAX (STEPT) as ±128ms for Crystal clock and ±512ms for Mains clock.
+// See https://www.eecis.udel.edu/~mills/ntp/html/clock.html regarding WATCH=300
+// -- https://www.eecis.udel.edu/~mills/database/rfc/rfc1305/rfc1305b.pdf
+#define STEPT .125         // step threshold (s)
+#define WATCH 900          // stepout threshold (s), 300s for NTP-4.2.8
+#define PANICT 1000        // panic threshold (s)
+#define PLL 65536          // PLL loop gain
+#define FLL (MAXPOLL + 1)  // FLL loop gain
+#define AVG 4              // parameter averaging constant
+#define ALLAN 1500         // compromise Allan intercept (s)
+#define ALLAN_XPT 11       // Allan intercept (log2(ALLAN))
+#define LIMIT 30           // poll-adjust threshold
+#define PGATE 4            // poll-adjust gate
+#define MAXFREQ 500e-6     // frequency tolerance (500 ppm)
+#define SGATE 3            // spike gate (clock filter)
+
+#define MINPOLL MINPOLL_SNTP  // That's not NTP, right?
 #define JAN_1970 2208988800UL // 1970 - 1900 in seconds
 
-// UNREACH value from RFC5905 is 12, but https://www.ntp.org/documentation/4.2.8-series/poll/
-// defines it as 10, so this code follows that guidance. PGATE and LIMIT are the same.
-#define AVG 4          // parameter averaging constant
-#define PGATE 4        // poll-adjust gate for jitter/offset ratio
-#define LIMIT 30       // poll-adjust threshold for jiggle counter
-#define UNREACH 10     // unreach counter threshold
-#define KODSTRAT 0     // Kiss-o'-Death stratum number
-#define MAXSTRAT 16    // maximum stratum number
-#define MAXDIST 1      // 1s, root distance threshold
-#define MAXDISP 16     // 16s
-#define MAXPOLL 17     // 36h, maximum poll exponent
-#define MINPOLL_NTP 4  // 16s, minimum poll exponent for NTPv4, RFC5905
-#define MINPOLL_SNTP 6 // 64s, minimum poll exponent for SNTP, RFC4330 Section 5
+// Terms of Service
+// [...]
+// 4. End-User agrees that he or she will not:
+// [...]
+// (b) Request time from the Services more than once every thirty (30) minutes
+// (ideally at even longer intervals), if using SNTP.
+#define NTPPOOL_MINPOLL ((uint8_t)11)  // https://www.ntppool.org/tos.html
+#define NTPPOOL_DOMAIN "pool.ntp.org"
 
-#define MINPOLL MINPOLL_SNTP // That's not NTP, right?
-#define MAXDISP_MS (MAXDISP * 1000)
-
-#define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
-#define ARRAY_END(x) (x + ARRAY_LEN(x))
 #define IS_POW2(x) (((x) & (x - 1)) == 0)
 
-static const uint32_t INADDR_ANY = 0;
+#if defined(__has_cpp_attribute) && __has_cpp_attribute(assume) == 202207L
+#   define ASSUME(x) [[assume(x)]];
+#elif defined(__has_builtin) && defined(__builtin_assume)
+#   if __has_builtin(__builtin_assume)
+#       define ASSUME(x) __builtin_assume(x)
+#   endif
+#endif
+#if !defined(ASSUME) && defined(__GNUC__)
+#   define ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+#else
+#   define ASSUME(x)
+#endif
 
-static signed char secondsToQHour(long timeOffset) { return timeOffset / 900; }
+static bool is_big_endian(void) {
+#if defined(__BIG_ENDIAN__)
+  return true;
+#elif defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+  return __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__;
+#else
+  const uint32_t i = 0x01020304;
+  const uint32_t* pi = &i;
+  const uint8_t* plsb = pi;
+  return *plsb == 0x01;
+#endif
+}
+static uint64_t ntoh64(uint64_t x) {
+  return is_big_endian() ? x : __builtin_bswap64(x);
+}
+static uint32_t ntoh32(uint32_t x) {
+  return is_big_endian() ? x : __builtin_bswap32(x);
+}
 
 static int clzul(unsigned long x) {
+  static_assert(sizeof(x) == 4);
   if (!x) return 32;
   int n = 0;
   if (!(x & 0xFFFF0000UL)) { n += 16; x <<= 16; }
@@ -71,11 +179,32 @@ static int clzul(unsigned long x) {
 
 static int log2ul(unsigned long x) { return 32 - 1 - clzul(x); }
 
-static unsigned char millisecondsToPollExponent(unsigned long updateInterval) {
+// Integer approximations lfplo2us() and us2lfplo() allow to avoid floating point arithmetics while
+// introducing average error of 4us and max error of 8.62us.  That's absolutely okay given limited
+// resolution of micros() on some Arduino boards: 4us on Nano, 8us on Lilypad.
+static unsigned long lfplo2us(uint32_t lfplo) {
+  // 2^32 / 1e6 = 4294.967296 ≈4295
+  return lfplo / UINT32_C(4295);
+}
+
+static uint32_t us2lfplo(unsigned long us) {
+  ASSUME(us <= 999999UL);
+  // 4295 * 999992 == 0xfffff988
+  if (us <= 999992UL)
+    return us * UINT32_C(4295);
+  // 999992…999999 ~ 0xF4238…0xF423F
+  return UINT32_C(0xFFFFF988) + UINT32_C(207) * (us & 7);
+}
+
+static uint64_t make_lfp48(uint32_t hi, uint16_t lo) {
+  return (uint64_t(hi) << 32) | (uint32_t(lo) << 16);
+}
+
+static unsigned char millisToPollExponent(unsigned long updateInterval) {
   updateInterval /= 1000;
   unsigned char pollExponent = log2ul(updateInterval);
   if (!IS_POW2(updateInterval))
-    pollExponent++; // 3600_000ms should map to 64s, not 32s ;-)
+    pollExponent++;  // 3600_000ms should map to 64s, not 32s ;-)
   if (pollExponent < MINPOLL)
     pollExponent = MINPOLL;
   if (pollExponent > MAXPOLL)
@@ -83,295 +212,839 @@ static unsigned char millisecondsToPollExponent(unsigned long updateInterval) {
   return pollExponent;
 }
 
-static void randomSeed() {
-  unsigned long r = random(LONG_MAX); // in case if it's already seeded
-  for (int i = 0; i < sizeof(r) * 8; i++)
-    r ^= ((unsigned long)analogRead(0)) << i; // analogRead() is just 10..12 bits
-  randomSeed(r);
+static void randomXmt(uint16_t* xmt16) {
+  // random() is a 31-bit generator, so two bits are quite deterministic. Anyway, it's not CSPRNG.
+  // Also random() is somewhat slow, so two bits matter less than one extra random() call.
+  long r;
+  xmt16[0] = r = random();
+  xmt16[1] = r >> 16;
+  xmt16[2] = r = random();
+  xmt16[3] = r >> 16;
 }
 
-static bool isBadRootDistance(unsigned char *pkt) {
-  const unsigned long rootdelay =
-      pkt[ROOTDELAY_OFFSET + 0] << 24 | pkt[ROOTDELAY_OFFSET + 1] << 16 |
-      pkt[ROOTDELAY_OFFSET + 2] << 8 | pkt[ROOTDELAY_OFFSET + 3];
-  const unsigned long rootdisp =
-      pkt[ROOTDISP_OFFSET + 0] << 24 | pkt[ROOTDISP_OFFSET + 1] << 16 |
-      pkt[ROOTDISP_OFFSET + 2] << 8 | pkt[ROOTDISP_OFFSET + 3];
-  // That's (rootdelay / 2 + rootdisp >= MAXDIST), adjusted for possible overflow.
-  const unsigned long maxdist = MAXDIST << 16;
-  return (rootdelay >> 2) + (rootdisp >> 1) >= (maxdist >> 1);
+// Modern compiler is capable of evaluating that at compile and/or link time.
+static bool strEndsWith(const char* haystack, const char* needle) {
+  return strlen(haystack) >= strlen(needle) &&
+         strstr(haystack, needle) == haystack + strlen(haystack) - strlen(needle);
 }
 
-NTPClient::NTPClient(UDP& udp, long timeOffset) {
-  randomSeed();
-  _udp = &udp;
-  _flags = 0;
-  _srcPort = 0;
-  setTimeOffset(timeOffset);
-  _serverName = ARDUINO_NTP_SERVER;
-  _serverIP = INADDR_ANY;
-  resetNtpPoll(ARDUINO_NTP_MINPOLL);
+static uint16_t randomEphemeralPort(void) {
+  // Port is randomized per RFC 6056 (Recommendations for Transport-Protocol Port Randomization).
+  // Section 3.2 (Ephemeral Port Number Range) suggests to use the full range.
+  // Port it persisted while talking to the same ServerIP to reduce Effects on Path Selection per
+  // RFC 9109 (NTPv4: Port Randomization).  Real-world ECMP routes might be dozens of milliseconds
+  // different and lead to unnecessary jitter.  And low jitter is a key to higher poll interval.
+  // Every random(void) call is ≈51 micros and random(NN) is ≈90 micros on Arduino Uno.
+  // So that's one sample + fastrange() instead of random(1024, 65535 + 1);
+  const uint16_t low = 1024, high = 65535;
+  const unsigned long rl = random();
+  const uint16_t r16 = rl;
+  if (r16 >= low)
+    return r16;
+  const uint32_t rFolded = uint16_t(rl ^ (rl >> 16));
+  const uint16_t r16hi = (rFolded * (high - low)) >> 16;
+  return low + r16hi;  // it's biased, but is guaranteed to terminate fast unlike sampling loop
 }
 
-NTPClient::NTPClient(UDP& udp, const char* serverName, long timeOffset, unsigned long updateInterval) {
-  randomSeed();
-  _udp = &udp;
-  _flags = 0;
-  _srcPort = 0;
-  setTimeOffset(timeOffset);
-  _serverName = serverName;
-  _serverIP = INADDR_ANY;
-  setUpdateInterval(updateInterval);
+static uint64_t micros63(void) {
+  // We save 4 bytes using the MSB of `high` to store MSB of `last` as we don't need full value
+  // to detect overflow. micros63() overflows in 292 millennia (micros47() takes just 4.5 years).
+  static uint32_t high = 0;
+  const uint32_t now = micros();  // micros() overflows every 1h11m
+  const uint8_t oldMSB = (high >> 24) & 0x80;
+  const uint8_t nowMSB = (now >> 24) & 0x80;
+  if (nowMSB < oldMSB)
+    high++;
+  high &= UINT32_C(0x7FFFFFFF);
+  const uint64_t ret = (uint64_t(high) << 32) | now;
+  high |= now & UINT32_C(0x80000000);
+  return ret;
 }
 
-NTPClient::NTPClient(UDP& udp, IPAddress poolServerIP, long timeOffset, unsigned long updateInterval) {
-  randomSeed();
-  _udp = &udp;
-  _flags = 0;
-  _srcPort = 0;
-  setTimeOffset(timeOffset);
-  _serverName = NULL;
-  _serverIP = poolServerIP;
-  setUpdateInterval(updateInterval);
+uint32_t NtpPacket::RootDistFP(void) const {
+  return (ntoh32(RootDelay) >> 1) + ntoh32(RootDispersion);
 }
 
-unsigned char NTPClient::ntppoolExponent(unsigned char pollExponent) const {
-  if (_serverName && strcmp(_serverName, ARDUINO_NTP_SERVER) == 0)
-    if (pollExponent < ARDUINO_NTP_MINPOLL)
-      return ARDUINO_NTP_MINPOLL;
-  return pollExponent;
+NTPClient::NTPClient(UDP& udp, long timeOffset)
+  : _udp(udp)
+{
+  ctor(timeOffset);
+  // default updateInterval is 60s for NTPClient 3.x.x, so MINPOLL_SNTP of 6 suits well.
+  this->_pollExponent = minpoll();
 }
 
-void NTPClient::resetNtpPoll(unsigned char pollExponent) {
-  _pollExponent = pollExponent;
-  _reach = _unreach = _jiggle = 0;
-  // _srcPort is reset as soon as associated is reset, new association gets new port per RFC 9109.
-  if (!(_flags & _confSrcPort))
-    _srcPort = 0;
-  if (_flags & _udpSetup)
-    this->end();
+NTPClient::NTPClient(UDP& udp, const char* poolServerName, long timeOffset, unsigned long updateInterval)
+  : _udp(udp)
+{
+  ctor(timeOffset);
+  this->_poolServerName = poolServerName;
+  this->_doResolve      = true;
+  this->_pollExponent   = millisToPollExponent(updateInterval);
+  if (isPollingNtppool())
+    this->_pollExponent = max(_pollExponent, NTPPOOL_MINPOLL);
 }
 
-void NTPClient::unreachPollInterval(void) {
-  if (_reach) {
-    _unreach = 0; // The server is reachable.
-  } else if (_unreach < UNREACH) {
-    // The server is unreachable, so bump the unreach counter.  If the unreach threshold has been
-    // reached, double the poll interval to minimize wasted network traffic.
-    _unreach++;
+NTPClient::NTPClient(UDP& udp, IPAddress poolServerIP, long timeOffset, unsigned long updateInterval)
+  : _udp(udp)
+{
+  ctor(timeOffset);
+  this->_poolServerIP   = poolServerIP;
+  this->_poolServerName = NULL;
+  this->_pollExponent   = millisToPollExponent(updateInterval);
+}
+
+void NTPClient::ctor(long timeOffset) {
+  _timeOffset = timeOffset;
+  _keepPortOnNewIP = false;
+  _udpSetup = false;
+  _doResolve = false;
+  _waitingForReply = false;
+  _clockState = NCLK;
+  _freq = 0; // -17.720e-6;  // 0.0; // -448.61e-6; // -478e-6;  // TODO: add flag for FSET
+  _lastMicros = 0;
+  _lastUnix = 0;
+  _lastOffset = 0;
+  _clockJitter = LOG2D(S_PRECISION);
+#ifdef NTPCLIENT_SYSLOG
+  _wander = 0;
+#endif
+  clearAssociation();
+}
+
+void NTPClient::clearAssociation() {
+  for (Sample *s = _filter; s != ARRAY_END(_filter); s++) {
+    s->unixHigh = 0;
+    s->unixLFP16 = 0;
+    s->delayMicros16 = UINT16_MAX;
+    s->offset = 0;
+  }
+  _filterNextIndex = 0;
+  _jiggleCount = 0;
+  _reach = 0;
+  _pollExponent = minpoll();
+}
+
+bool NTPClient::isPollingNtppool() const {
+  return _poolServerName && strEndsWith(_poolServerName, NTPPOOL_DOMAIN);
+}
+
+unsigned char NTPClient::minpoll() const {
+  return isPollingNtppool() ? NTPPOOL_MINPOLL : MINPOLL;
+}
+
+void NTPClient::begin() {
+  end();
+  if (!this->_keepPortOnNewIP)
+    this->_port = randomEphemeralPort();
+  if (this->_udp.begin(this->_port) != 0)
+    this->_udpSetup = true;
+}
+
+void NTPClient::begin(unsigned int port) {
+  this->_port = port;
+  this->_keepPortOnNewIP = true;
+  begin();
+}
+
+bool NTPClient::forceUpdate() {
+  if (!_waitingForReply) {
+    if (sendRequest()) {
+      _waitingForReply = true;
+    } else {
+      return false;
+    }
+  }
+  return update();
+}
+
+bool NTPClient::maintain() {
+  if (!_waitingForReply) {
+    const unsigned long tillPoll = _nextPollMillis - millis();  // >LONG_MAX on overflow
+    if (tillPoll > LONG_MAX || _clockState == NCLK) {
+      if (sendRequest())
+        _waitingForReply = true;
+    }
+    return false;
   } else {
-    // If the timer exceeds the unreach threshold set at 10, the poll exponent is incremented by 1
-    // and the unreach timer set to 0. -- https://www.ntp.org/documentation/4.2.8-series/poll/
-    _pollExponent = min(_pollExponent + 1, MAXPOLL);
-    _unreach = 0;
+    return checkForReply();
   }
 }
 
-void NTPClient::jigglePollInterval(int offsetMillis) {
-  // Compute the clock jitter as the RMS of exponentially weighted offset differences.
-  // This is used by the poll-adjust code.
-  const int dOffset = offsetMillis - _lastOffsetMillis;
-  const double etemp = sq(_clockJitter);
-  const double dtemp = sq(max(fabs(dOffset * 0.001), 0.001));
-  _clockJitter = sqrt(etemp + (dtemp - etemp) / AVG);
+bool NTPClient::sendRequest() {
+  #ifdef DEBUG_NTPClient
+    Serial.println("Update from NTP Server");
+  #endif
+  if (!this->_udpSetup)
+    this->begin();
+  if (!this->_udpSetup)
+    return false;
+
+  // flush any existing packets
+  while(this->_udp.parsePacket() != 0)
+    this->_udp.flush();
+
+  _reach <<= 1;
+  randomXmt(_xmt16);
+  this->sendNTPPacket((unsigned char*)_xmt16);
+  return true;
+}
+
+bool NTPClient::checkForReply() {
+  int cb = 0;
+  do {
+    cb = this->_udp.parsePacket();
+    // TODO: check if parsePacket() discards the current packet on mismatching size?
+  } while (cb && cb != NTP_PACKET_SIZE);
+  const uint64_t t4 = micros63();
+  const unsigned long t4low = t4;
+  const unsigned long dt41 = t4low - _t1;
+  if (!cb) {
+    // NTPClient-3.2.1 had default timeout of 1000ms, but 2s is picked here as it is based on BTIME.
+    // Reference implementation does not respond to the same node more often than once in BTIME.
+    // Timeout of 2s also correlates well with MAXDIST of 1s and root_dist() calculation.
+    // So it's a good timeout from update() and forceUpdate() standpoint.
+    // See "Minimum Headway Time" in https://www.eecis.udel.edu/~mills/ntp/html/rate.html
+    if (dt41 > BTIME * 1000UL * 1000UL)
+      scheduleNextPoll();
+    return false;
+  }
+
+  union {
+    byte pkt[NTP_PACKET_SIZE];
+    NtpPacket ntp;
+  } u;
+  static_assert((void*)&u.pkt == (void*)&u.ntp);
+  byte* const pkt = u.pkt;
+  this->_udp.read(pkt, NTP_PACKET_SIZE);
+
+  // Using `memcmp() > 0` for ordering does the wrong thing for some seconds durring NTP rollover
+  // in 2036.  We'll be good as soon both RefTime and Xmt overflow, so it's not a big deal.
+  // memcmp() should save few bits on ATmega328p compared to true uint64_t math.
+  if (memcmp(pkt + ORG_OFFSET, _xmt16, 8) != 0 ||
+      (!_doResolve && _udp.remoteIP() != _poolServerIP) ||
+      _udp.remotePort() != PORT ||
+      u.ntp.VerMode() != Ver4Server || u.ntp.Stratum > MAXSTRAT ||
+      u.ntp.RootDistFP() >= MaxDispersionFP ||
+      memcmp(pkt + REC_OFFSET, pkt + XMT_OFFSET, 8) > 0 ||
+      memcmp(pkt + REF_OFFSET, pkt + XMT_OFFSET, 8) > 0)
+    return false; // mismatching cookie and/or malformed packet
+
+  // Now, we're confident that we got well-formed Reply from The Server.
+  const uint64_t rec = ntoh64(u.ntp.Rec);
+  const uint64_t xmt = ntoh64(u.ntp.Xmt);
+  const uint64_t srvDtLFP = xmt - rec;
+  const uint32_t srvDtSec = srvDtLFP >> 32;
+  const uint32_t srvDtLow = srvDtLFP;
+  const uint64_t srvMidpLFP = rec + (srvDtLFP >> 1);  // in LFP, NTP-Long-Fixed-Point
+  const uint32_t srvMidpSec = srvMidpLFP >> 32;
+  const uint32_t srvMidpLow = srvMidpLFP;
+  const int64_t ourMidpMicros = t4 - (dt41 >> 1);    // in micros63()
+  const uint64_t ourMidpUnixLFP = unixLFPAt(ourMidpMicros);
+  const uint32_t srvMidpUnix = srvMidpSec - JAN_1970;
+  const uint64_t srvMidpUnixLFP = uint64_t(srvMidpUnix) << 32 | srvMidpLow;
+
+  bool clockUpdated = false;
+  if (u.ntp.Stratum == KODSTRAT) {
+    // An SNTP client should stop sending to a particular server if that server returns a reply with
+    // a Stratum field of 0 (kiss-o'-death packet), regardless of kiss code, and an alternate server
+    // is available.  If no alternate server is available, the client should retransmit using an
+    // exponential backoff algorithm. -- RFC 4330: SNTPv4
+    //
+    // Unfortunately, UDP class does not provide DNS API, so we don't really know if we have
+    // an alternate server or not.  So, we have to resort to doing next query with DNS resolution
+    // to, maybe, get a new IP, and increasing poll interval at the same time.
+    _pollExponent = min(_pollExponent + 1, MAXPOLL);
+    _doResolve = true;
+    // TODO: verify that actual KoD senders pass malformed packet filter and reach this code
+  } else if (srvDtSec == 0 && u.ntp.Leap() != NOSYNC && u.ntp.Stratum != MAXSTRAT) {
+    if (_doResolve) {
+      _doResolve = false;
+      const IPAddress remoteIP(_udp.remoteIP());
+      if (_poolServerIP != remoteIP) {
+        _pollExponent = minpoll();  // new association
+        _poolServerIP = remoteIP;
+      }
+    }
+
+    _reach |= 1;
+    if (_clockState != NCLK) {
+
+      // Offset = theta = T(B) - T(A) = [(T2-T1) + (T3-T4)]/2 = [(T2+T3) - (T1+T4)]/2
+      // Delay  = delta = T(ABA) = (T4-T1) - (T3-T2)
+      //
+      // The delay calculation is a special case.  In cases where the server and client clocks
+      // are running at different rates and with very fast networks, the delay can appear negative.
+      // In order to avoid violating the Principle of Least Astonishment, the delay is clamped
+      // not less than the system precision.
+      //
+      // Dispersion is not calculated as it's not very useful in a single-peer case: it's used
+      // for peer ranking, for sys.rootdisp (that's not exposeed unless we speak NTP as a server)
+      // and as a constant term in root_dist(peer) calculation.
+      const int32_t srvDtMicros = lfplo2us(srvDtLow);
+      const uint32_t delayMicros = max(int32_t(dt41) - srvDtMicros, S_PRECISIONMICROS);
+
+      const double offset = srvMidpUnixLFP >= ourMidpUnixLFP
+                          ? (srvMidpUnixLFP - ourMidpUnixLFP) / FRAC
+                          : (ourMidpUnixLFP - srvMidpUnixLFP) / FRAC * -1.0;
+
+      clockUpdated = clockFilter(srvMidpUnixLFP, offset, delayMicros);
+    } else {
+      // Arduino boards usually have no RTC, so the very first sample has truly meaningless offset,
+      // so the 1st sample does not go through clock_filter().
+      const uint32_t srvMicros = lfplo2us(srvMidpLow);
+      _lastUnix = srvMidpSec - JAN_1970;
+      _lastMicros = ourMidpMicros - srvMicros;  // to avoid fractional part of _lastUnix
+      // clearAssociation() was called by ctor()
+      _clockState = _freq == 0.0 ? NSET : FSET;
+      clockUpdated = true;
+    }
+  } else {
+    // TODO: should we update _pollExponent ?
+    _doResolve = true;
+  }
+  scheduleNextPoll();
+
+  const uint32_t syslogIPu32(
+#ifdef NTPCLIENT_SYSLOG
+      ntoh32(NTPCLIENT_SYSLOG)
+#else
+      0
+#endif
+  );
+  if (syslogIPu32) {
+#ifndef NTPCLIENT_SYSLOG
+    static const double _wander = NAN;  // make compiler a bit less unhappy
+#endif
+    // RFC 5424 (The Syslog Protocol) defines maximum value of 2147483647. Overflow is unlikely.
+    static unsigned long sequenceId = 1;
+    static unsigned long bootId = random();
+    // No timestamp to avoid calendar computation for YYYY-DD-MM part.
+    // sysUpTime is time in hundredths of a second since boot.
+    char msg[300];
+    const unsigned long uptimeCentis = t4 / 10000;
+    const long lastOffsetMicros = lrint(_lastOffset * 1e6);
+    const long clockJitterMicros = lrint(_clockJitter * 1e6);
+    const long peerJitterMicros = lrint(peerJitter(bestSample()) * 1e6);
+    const char* const stateNames[] = {"NCLK", "NSET", "FSET", "SPIK", "FREQ", "SYNC"};
+    const char offSign = srvMidpUnixLFP >= ourMidpUnixLFP ? '+' : '-';
+    const int64_t offAbsLFP = srvMidpUnixLFP >= ourMidpUnixLFP ? (srvMidpUnixLFP - ourMidpUnixLFP)
+                                                               : (ourMidpUnixLFP - srvMidpUnixLFP);
+    const uint32_t offSec = (offAbsLFP >> 32);
+    const uint32_t offLow = offAbsLFP;
+    char freqPPM[33], wanderPPM[33];  // TODO: suboptimal allocation
+    dtostrf(_freq * 1e6, 0, 3, freqPPM);
+    dtostrf(_wander * 1e6, 0, 3, wanderPPM);
+    int sz = snprintf(
+        msg, sizeof(msg),
+        "<101>1 - pogo NTPClient %08lx rec - [meta sysUpTime=\"%lu\" sequenceId=\"%lu\"]"
+        "[SNTP@64338 r.ip=\"%08lx\" r.MIDP=\"%08lx.%08lx\" r.Off=\"%c%lx.%08lx\" "
+        "r.Rtt=\"%lu\" p.rch=\"%o\" p.Off=\"%ld\" p.jtr=\"%ld\" p.pol=\"%u\" "
+        "c.us=\"0x%lx%08lx\" c.sta=\"%s\" c.jtr=\"%ld\" c.frq=\"%s\" wnd=\"%s\"]",
+        bootId, uptimeCentis, sequenceId++, ntoh32(_poolServerIP), srvMidpSec, srvMidpLow,
+        offSign, offSec, offLow, dt41, _reach, lastOffsetMicros, peerJitterMicros, _pollExponent,
+        (unsigned long)(ourMidpMicros >> 32), (unsigned long)(ourMidpMicros),
+        stateNames[_clockState], clockJitterMicros, freqPPM, wanderPPM);
+    sz = min(max(sz, 0), (int)sizeof(msg));
+    _udp.beginPacket(IPAddress(syslogIPu32), 514);
+    _udp.write((uint8_t*)msg, sz);
+    _udp.endPacket();
+  }
+  return clockUpdated;
+}
+
+const NTPClient::Sample* NTPClient::bestSample() const {
+  // The entry with lowest delay represents the best sample, but it might be old.
+  const Sample *best = _filter;
+  for (const Sample *s = _filter + 1; s != _filter + NSTAGE; s++)
+    if (s->delayMicros16 < best->delayMicros16)
+      best = s;
+  return best;
+}
+
+double NTPClient::peerJitter(const Sample *best) const {
+  double peerJitter = 0;
+  int valid = 0;
+  for (const Sample *s = _filter; s != _filter + NSTAGE; s++)
+    if (s != best && s->delayMicros16 != UINT16_MAX) {
+      peerJitter += sq(s->offset - best->offset);
+      valid++;
+    }
+  peerJitter = max(valid ? sqrt(peerJitter / valid) : 0, LOG2D(S_PRECISION));
+  return peerJitter;
+}
+
+// clock_filter() - select the best from the latest eight delay/offset samples.
+bool NTPClient::clockFilter(uint64_t unixLFP, double offset, uint32_t delayMicros) {
+  // The clock filter contents consist of eight tuples (offset, delay, time). Without dispersion.
+  // Reference implementation uses shift register, that's a ring buffer.
+  Sample& next = _filter[_filterNextIndex++];
+  next.unixHigh = unixLFP >> 32;
+  next.unixLFP16 = uint16_t(unixLFP >> 16);
+  next.delayMicros16 = (delayMicros + (UINT32_C(1) << MICROS16_SHR) - 1) >> MICROS16_SHR;
+  next.offset = offset;
+
+  const Sample *best = bestSample();
+
+  // Prime directive: use a sample only once and never a sample older than the latest one.
+  // RFC says "anything goes before first synchronized", but NOSYNC is handled at NSET stage.
+  if (best->unixHigh <= _lastUnix)  // uint32_t Unix time is good till 2106, that's okay.
+    return false;
+
+  // Popcorn spike suppressor.  Compare the difference between the last and current offsets
+  // to the current jitter.  If greater than SGATE (3) and if the interval since the last offset
+  // is less than twice the system poll interval, dump the spike.
+  if (fabs(best->offset - _lastOffset) > SGATE * peerJitter(best) &&
+      (best->unixHigh - _lastUnix) < (UINT32_C(1) << (1 + _pollExponent)))
+    return false;
+
+  if (best != &next) {
+    unixLFP = make_lfp48(best->unixHigh, best->unixLFP16);
+    offset = best->offset;
+  }
+  return clockUpdate(unixLFP, offset);
+}
+
+bool NTPClient::clockUpdate(uint64_t unixLFP, double offset) {
+  switch (localClock(unixLFP, offset)) {
+    // The offset is too large and probably bogus.  Complain to the system log and order
+    // the operator to set the clock manually within PANIC range.  The reference implementation
+    // includes a command line option to disable this check and to change the panic threshold
+    // from the default 1000 s as required.
+    case PANIC:
+      _doResolve = true;
+      // XXX: _clockState = NSET ?...
+      return false;
+
+    // The offset is more than the step threshold (0.125 s by default).  After a step, all
+    // associations now have inconsistent time values, so they are reset and started fresh.
+    // The step threshold can be changed in the reference implementation in order to lessen
+    // the chance the clock might be stepped backwards.  However, there may be serious consequences,
+    // as noted in the white papers at the NTP project site.
+    case STEP:
+      clearAssociation();
+      // s.stratum = MAXSTRAT;
+      return true;
+
+    // The offset was less than the step threshold, which is the normal case.  Update the system
+    // variables from the peer variables.  The lower clamp on the dispersion increase is to avoid
+    // timing loops and clockhopping when highly precise sources are in play.  The clamp can be
+    // changed from the default .01 s in the reference implementation.
+    case SLEW:
+      return true;
+
+    // Some samples are discarded while, for instance, a direct frequency measurement is being made.
+    case IGNORE:
+      return false;
+  }
+  return false;  // FIXME: unreachable
+}
+
+unsigned char NTPClient::localClock(uint64_t unixLFP, double offset) {
+  // Following times are used in RFC's local_clock():
+  //  - p.t -- last sample out of peer's clock_filter()
+  //  - s.t -- last system clock update time
+  //  - c.t -- process time, "now"
+  double etemp, dtemp;
+
+  // If the offset is too large, give up and go home.
+  if (fabs(offset) > PANICT)
+    return PANIC;
+
+  // Clock state machine transition function.  This is where the action is and defines
+  // how the system reacts to large time and frequency errors.  There are two main regimes:
+  // when the offset exceeds the step threshold and when it does not.
+  int rval = SLEW;
+  const double mu = (unixLFP - make_lfp48(_lastUnix, _lastUnixLFP16)) / FRAC;  // interval since last update
+  double freq = 0;  // frequency error
+  if (fabs(offset) > STEPT) {
+    switch (_clockState) {
+      // In SYNC state, we ignore the first outlier and switch to SPIK state.
+      case SYNC:
+        _clockState = SPIK;
+        return SLEW;
+
+      // In FREQ state, we ignore outliers and inliers.  At the first outlier after the stepout
+      // threshold, compute the apparent frequency correction and step the time.
+      case FREQ:
+        if (mu < WATCH)
+          return IGNORE;
+
+        freq = (offset - clockOffset) / mu;
+        // fall through
+
+      // In SPIK state, we ignore succeeding outliers until either an inlier is found or the stepout
+      // threshold is exceeded.
+      case SPIK:
+        if (mu < WATCH)
+          return IGNORE;
+        // fall through
+
+      // We get here by default in NSET and FSET states and from above in FREQ state.
+      // Step the time and clamp down the poll interval.
+      //
+      // In NSET state, an initial frequency correction is not available, usually because
+      // the frequency file has not yet been written.  Since the time is outside the capture range,
+      // the clock is stepped.  The frequency will be set directly following the stepout interval.
+      //
+      // In FSET state, the initial frequency has been set from the frequency file.  Since the time
+      // is outside the capture range, the clock is stepped immediately, rather than after the stepout
+      // interval.  Guys get nervous if it takes 17 minutes to set the clock for the first time.
+      //
+      // In SPIK state, the stepout threshold has expired and the phase is still above the step
+      // threshold.  Note that a single spike greater than the step threshold is always suppressed,
+      // even at the longer poll intervals.
+      default:
+        // This is the kernel set time function, usually implemented by the Unix settimeofday()
+        // system call.
+        step_time(offset);
+        _jiggleCount = 0;
+        _pollExponent = minpoll();
+        rval = STEP;
+        if (_clockState == NSET) {
+          rstclock(FREQ, unixLFP, 0);
+          return STEP;
+        }
+    }
+    rstclock(SYNC, unixLFP, 0);
+  } else {
+    // Compute the clock jitter as the RMS of exponentially weighted offset differences.
+    // This is used by the poll-adjust code.
+    etemp = sq(_clockJitter);
+    dtemp = sq(max(fabs(offset - _lastOffset), LOG2D(S_PRECISION)));
+    _clockJitter = sqrt(etemp + (dtemp - etemp) / AVG);
+    switch (_clockState) {
+      // In NSET state, this is the first update received and the frequency has not been
+      // initialized.  The first thing to do is directly measure the oscillator frequency.
+      case NSET:
+        rstclock(FREQ, unixLFP, offset);
+        return SLEW; // RFC returns IGNORE, but SLEW suits us better and follows SYNC->SPIK pattern.
+
+      // In FSET state, this is the first update and the frequency has been initialized.
+      // Adjust the phase, but don't adjust the frequency until the next update.
+      case FSET:
+        rstclock(SYNC, unixLFP, offset);
+        break;
+
+      // In FREQ state, ignore updates until the stepout threshold.
+      // After that, correct the phase and frequency and switch to SYNC state.
+      case FREQ:
+        // XXX: RFC says `c.t - s.t < WATCH`, saying `$now - _lastUnix < WATCH`.
+        // NTP-4.2.8p15 says `mu < WATCH` in the clock discipline comment.
+        if (mu < WATCH)
+          return IGNORE;
+
+        freq = (offset - clockOffset) / mu;
+        rstclock(SYNC, unixLFP, offset);
+        break;
+
+      // We get here by default in SYNC and SPIK states.
+      // Here we compute the frequency update due to PLL and FLL contributions.
+      default:
+        // The FLL and PLL frequency gain constants depending on the poll interval and Allan
+        // intercept.  The FLL is not used below one half the Allan intercept.  Above that
+        // the loop gain increases in steps to 1 / AVG.
+#if 0
+        if (LOG2D(_pollExponent) > ALLAN / 2) {
+          etemp = FLL - _pollExponent;
+          if (etemp < AVG)
+            etemp = AVG;
+          freq += (offset - clockOffset) / (max(mu, ALLAN) * etemp);
+        }
+#else
+        // const double CLOCK_FLL = 0.25; // FLL loop gain
+        const double CLOCK_FLL = AVG;
+        if (_pollExponent >= ALLAN_XPT)
+          freq += (offset - clockOffset) /
+                  (max(mu, LOG2D(_pollExponent)) * CLOCK_FLL);
+#endif
+
+        // For the PLL the integration interval (numerator) is the minimum of the update interval
+        // and poll interval.  This allows oversampling, but not undersampling.
+#if 0
+        etemp = min(mu, LOG2D(_pollExponent));
+        dtemp = 4 * PLL * LOG2D(_pollExponent);
+        freq += offset * etemp / (dtemp * dtemp);
+#else
+        const double CLOCK_PLL = 16.; // PLL loop gain (log2)
+        etemp = min(mu, LOG2D(ALLAN_XPT));
+        dtemp = 4 * CLOCK_PLL * LOG2D(_pollExponent);
+        freq += offset * etemp / (dtemp * dtemp);
+#endif
+        rstclock(SYNC, unixLFP, offset);
+        break;
+    }
+  }
+
+  // Calculate the new frequency and frequency stability (wander).  Compute the clock wander
+  // as the RMS of exponentially weighted frequency differences.  This is not used directly,
+  // but can, along with the jitter, be a highly useful monitoring and debugging tool.
+  const double freqNext = freq + _freq;
+  _freq = max(min(MAXFREQ, freqNext), -MAXFREQ);
+#ifdef NTPCLIENT_SYSLOG
+  // TODO: RFC code computes RMS of freqNext, however the RFC text suggests that RMS of "frequency
+  // difference" might be calculated. Reference implementation calculates it as a clock_stability.
+  etemp = sq(_wander);
+  dtemp = sq(freq);
+  _wander = sqrt(etemp + (dtemp - etemp) / AVG);
+#endif
 
   // Here we adjust the poll interval by comparing the current offset with the clock jitter.
   // If the offset is less than the clock jitter times a constant, then the averaging interval
   // is increased; otherwise, it is decreased.  A bit of hysteresis helps calm the dance.
-  if (fabs(offsetMillis * 0.001) < PGATE * _clockJitter) {
-    _jiggle += _pollExponent;
-    if (_jiggle > LIMIT) {
-      _jiggle = LIMIT;
+  // "The current offset" is _lastOffset as it was updated with rstclock() above.
+  //
+  // XXX: RFC 5905 and ntp-4.2.8p15 say >LIMIT whitepaper "Technical Report 06-6-1: NTPv4 Reference
+  // and Implementation Guide" says >=LIMIT.  https://www.ntp.org/reflib/reports/ntp4/ntp4.pdf
+  if (fabs(_lastOffset) < PGATE * _clockJitter) {
+    _jiggleCount += _pollExponent;
+    if (_jiggleCount > LIMIT) {
+      _jiggleCount = LIMIT;
       if (_pollExponent < MAXPOLL) {
-        _jiggle = 0;
+        _jiggleCount = 0;
         _pollExponent++;
       }
     }
   } else {
-    _jiggle -= _pollExponent << 1;
-    if (_jiggle < -LIMIT) {
-      _jiggle = -LIMIT;
-      if (_pollExponent > MINPOLL) {
-        _jiggle = 0;
+    _jiggleCount -= _pollExponent << 1;
+    if (_jiggleCount < -LIMIT) {
+      _jiggleCount = -LIMIT;
+      if (_pollExponent > minpoll()) {
+        _jiggleCount = 0;
         _pollExponent--;
       }
     }
   }
+  return rval;
 }
 
-int NTPClient::begin(unsigned int port) {
-  // Port is randomized per RFC 6056 (Recommendations for Transport-Protocol Port Randomization).
-  if (port == 0)
-    port = (_flags & _confSrcPort) ? _srcPort : random(1024, 65535);
-  else
-    _flags |= _confSrcPort;
-  // It's persisted to reduce Effects on Path Selection per RFC 9109 (NTPv4: Port Randomization).
-  if (_srcPort == 0)
-    _srcPort = port;
-  const int ret = _udp->begin(port);
-  if (ret == 1)
-    _flags |= _udpSetup;
-  return ret;
+void NTPClient::step_time(double offset) {
+  ASSUME(-PANIC <= offset && offset <= PANICT);
+  _lastMicros -= offset * 1e6;
 }
 
-bool NTPClient::forceUpdate() {
-  if (!(_flags & _udpSetup))
-    if (this->begin() != 1)
-      return false;
+void NTPClient::rstclock(unsigned char clockState, uint64_t unixLFP, double offset) {
+  _clockState = clockState;
 
-  #ifdef DEBUG_NTPClient
-    Serial.println("Update from NTP Server");
-  #endif
+  step_time(offset);
+  _lastOffset = offset;
 
-  // flush any existing packets
-  while(this->_udp->parsePacket() != 0)
-    this->_udp->flush();
+  const uint32_t unix = unixLFP >> 32;
+  const uint32_t since = unix - _lastUnix;
+  _lastUnix += since;
+  _lastUnixLFP16 = unixLFP >> 16;
+  const int64_t sinceMicrosRaw = UINT64_C(1000000) * since;
+  _lastMicros += sinceMicrosRaw - freqErr(sinceMicrosRaw);
+}
 
-  // Shift the reachability register to the left.  Hopefully, some time before the next poll
-  // a packet will arrive and set the rightmost bit.
-  _reach <<= 1;
-  unreachPollInterval();
+#if 0
+struct NTPClock {
+  tstamp t;      // update time
+  int state;     // current state
+  double offset; // current offset
+  double last;   // previous offset
+  int count;     // jiggle counter
+  double freq;   // frequency
+  double jitter; // RMS jitter
+  double wander; // RMS wander
+} c;
 
-  unsigned short randTx[4];
-  for (unsigned short *p = randTx; p != ARRAY_END(randTx); p++) {
-    const long r = random();
-    *p = (unsigned short)(r ^ (r >> 16));
-  }
-  static_assert(sizeof(randTx) == 8);
-  const unsigned long t1 = sendNTPPacket((unsigned char*)randTx);
+struct s { // System structure
+  tstamp  t;              /* update time */
+  char    leap;           /* leap indicator */
+  char    stratum;        /* stratum */
+  char    poll;           /* poll interval */
+  char    precision;      /* precision */
+  double  rootdelay;      /* root delay */
+  double  rootdisp;       /* root dispersion */
+  char    refid;          /* reference ID */
+  tstamp  reftime;        /* reference time */
+  struct m m[NMAX];       /* chime list */
+  struct v v[NMAX];       /* survivor list */
+  struct p *p;            /* association ID */
+  double  offset;         /* combined offset */
+  double  jitter;         /* combined jitter */
+  int     flags;          /* option flags */
+  int     n;              /* number of survivors */
+} s;
 
-  unsigned long t4 = t1;
-  do {
-    delay(10);
-    const int sz = _udp->parsePacket();
-    t4 = millis();
-    if (sz != NTP_PACKET_SIZE || _udp->remotePort() != PORT)
-      continue; // not a relevant NTP packet for sure
+/* root_dist() - calculate root distance */
+double
+root_dist(struct p *p /* peer structure pointer */) {
+  /*
+   * The root synchronization distance is the maximum error due to all causes of the local clock
+   * relative to the primary server.  It is defined as half the total delay plus total dispersion
+   * plus peer jitter.
+   */
+  return (max(MINDISP, p->rootdelay + p->delay) / 2 +
+      p->rootdisp + p->disp + PHI * (c.t - p->t) + p->jitter);
+}
 
-    const unsigned char verAndMode = 0b00111111;
-    const unsigned char ver4Server = 0b00100100; // NTPv4, Mode=4 (server)
-    unsigned char pkt[NTP_PACKET_SIZE];
-    _udp->read(pkt, NTP_PACKET_SIZE);
-    // FIXME: using `memcmp() > 0` does wrong thing durring NTP rollover in 2036.
-    if (memcmp(pkt + ORG_OFFSET, randTx, 8) != 0 ||
-        (pkt[0] & verAndMode) != ver4Server || pkt[1] > MAXSTRAT ||
-        memcmp(pkt + REC_OFFSET, pkt + XMT_OFFSET, 8) > 0 ||
-        memcmp(pkt + REF_OFFSET, pkt + XMT_OFFSET, 8) > 0)
-      continue; // mismatching cookie and/or malformed packet
+/*
+ * fit() - test if association p is acceptable for synchronization
+ */
+int
+fit( struct peer *p             /* peer structure pointer */)
+{
+  /* A stratum error occurs if (1) the server has never been synchronized, (2) the server stratum is
+   * invalid.  */
+  if (p->leap == NOSYNC || p->stratum >= MAXSTRAT)
+    return (FALSE);
 
-    const IPAddress remoteIP = _udp->remoteIP();
-    if (INADDR_ANY == _serverIP) {
-      _serverIP = remoteIP;
-    } else if (_serverIP == remoteIP) {
-      ; // no-op
-    } else if (_flags & _tryDNS) {
-      // _pollExponent is kept intact and not reset to updateInterval as _tryDNS might be trigged
-      // by KODSTRAT.  Also, jigglePollInterval() should work if offset differs measurably.
-      resetNtpPoll(_pollExponent);
-      _serverIP = remoteIP;
-    } else if (!(_flags & _tryDNS)) {
-      continue; // reply from bogus remoteIP
-    }
-    _flags &= ~_tryDNS;
+  /*
+   * A distance error occurs if the root distance exceeds the distance threshold plus an increment
+   * equal to one poll interval.
+   */
+  if (root_dist(p) > MAXDIST + PHI * LOG2D(s.poll))
+    return (FALSE);
 
-    // Now, we're confident that we got The Reply from The Server.
+  /*
+   * A loop error occurs if the remote peer is synchronized to the local peer or the remote peer is
+   * synchronized to the current system peer.  Note this is the behavior for IPv4; for IPv6 the MD5
+   * hash is used instead.
+   */
+  if (p->refid == p->dstaddr || p->refid == s.refid)
+    return (FALSE);
 
-    if (pkt[1] == KODSTRAT) {
-      // An SNTP client should stop sending to a particular server if that server returns a reply
-      // with a Stratum field of 0 (kiss-o'-death packet), regardless of kiss code, and an alternate
-      // server is available.  If no alternate server is available, the client should retransmit
-      // using an exponential backoff algorithm. -- RFC 4330: SNTPv4
-      //
-      // Unfortunately, UDP class does not provide API for DNS, so we don't really know if we have
-      // an alternate server or not.  So, we have to resort to doing next query with DNS resolution
-      // and increasing poll interval.  New IP triggers resetNtpPoll().
-      _pollExponent = min(_pollExponent + 1, MAXPOLL);
-      _flags |= _tryDNS;
+  /* An unreachable error occurs if the server is unreachable.
+   */
+  if (p->reach == 0)
+    return (FALSE);
+
+  return (TRUE);
+}
+
+
+// rstclock() - clock state machine
+void rstclock(int state,     /* new state */
+              double offset, /* new offset */
+              double t       /* new update time */
+) {
+  // Enter new state and set state variables.  Note, we use the time of the last clock filter
+  // sample, which must be earlier than the current time.
+  c.state = state;
+  c.last = c.offset = offset;
+  s.t = t;
+}
+
+
+// clock_update() - update the system clock
+void clock_update(struct p* p /* peer structure pointer */) {
+  double dtemp;
+
+  // If this is an old update, for instance, as the result of a system peer change, avoid it.
+  // We never use an old sample or the same sample twice.
+  if (s.t >= p->t)
+    return;
+
+  // Combine the survivor offsets and update the system clock; the local_clock() routine will tell
+  // us the good or bad news.
+  s.t = p->t;
+  clock_combine();
+  switch (local_clock(p, s.offset)) {
+    // The offset is too large and probably bogus.  Complain to the system log and order the
+    // operator to set the clock manually within PANIC range.  The reference implementation includes
+    // a command line option to disable this check and to change the panic threshold from the
+    // default 1000 s as required.
+    case PANIC:
+      exit(0);
+
+    // The offset is more than the step threshold (0.125 s by default).  After a step, all
+    // associations now have inconsistent time values, so they are reset and started fresh.
+    // The step threshold can be changed in the reference implementation in order to lessen
+    // the chance the clock might be stepped backwards.  However, there may be serious
+    // consequences, as noted in the white papers at the NTP project site.
+    case STEP:
+      while (/* all associations */ 0)
+        clear(p, X_STEP);
+      s.stratum = MAXSTRAT;
+      s.poll = MINPOLL;
       break;
-    }
 
-    // Verify the server is synchronized with valid stratum and reference time not later
-    // than the transmit time.  Verify valid root distance.
-    const unsigned char leapNosync = 0b11000000;
-    if ((pkt[0] & leapNosync) != leapNosync && pkt[1] != MAXSTRAT && !isBadRootDistance(pkt)) {
-      _reach |= 1;
-      ingestGoodTime(pkt, t1, t4);
-    } else {
-      _flags |= _tryDNS;
-    }
-    break;
-  } while (t4 - t1 < NTP_TIMEOUT_MS);
+    // The offset was less than the step threshold, which is the normal case.  Update the system
+    // variables from the peer variables.  The lower clamp on the dispersion increase is to avoid
+    // timing loops and clockhopping when highly precise sources are in play.  The clamp can be
+    // changed from the default .01 s in the reference implementation.
+    case SLEW:
+      s.leap = p->leap;
+      s.stratum = p->stratum + 1;
+      s.refid = p->refid;
+      s.reftime = p->reftime;
+      s.rootdelay = p->rootdelay + p->delay;
+      dtemp = sqrt(sq(p->jitter) + sq(s.jitter));
+      dtemp += max(p->disp + PHI * (c.t - p->t) + fabs(p->offset), MINDISP);
+      s.rootdisp = p->rootdisp + dtemp;
+      break;
 
-  if (!_reach)
-    _flags |= _tryDNS;
-  _lastPollMillis = t4;
-  _flags |= _firstPollDone;
-
-  return (_reach & 1) ? true : false;
-}
-
-void NTPClient::ingestGoodTime(unsigned char *pkt, unsigned long t1millis, unsigned long t4millis) {
-  // That's basic SNTP math done in fixed point arithmetics to avoid FPU usage on MCU. *sec parts
-  // are full NTP seconds, *p32 parts are 1/2^32 parts of second, fractional parts of NTP seconds,
-  // *millis are milliseconds.  (A+B)/2 is expressed as (A+(B-A)/2) to deal with wrapping overflow.
-  const unsigned long t2sec = pkt[REC_OFFSET + 0] << 24 | pkt[REC_OFFSET + 1] << 16 |
-                              pkt[REC_OFFSET + 2] << 8 | pkt[REC_OFFSET + 3];
-  const unsigned long t2p32 = pkt[REC_OFFSET + 4] << 24 | pkt[REC_OFFSET + 5] << 16 |
-                              pkt[REC_OFFSET + 6] << 8 | pkt[REC_OFFSET + 7];
-  const unsigned long t3sec = pkt[XMT_OFFSET + 0] << 24 | pkt[XMT_OFFSET + 1] << 16 |
-                              pkt[XMT_OFFSET + 2] << 8 | pkt[XMT_OFFSET + 3];
-  const unsigned long t3p32 = pkt[XMT_OFFSET + 4] << 24 | pkt[XMT_OFFSET + 5] << 16 |
-                              pkt[XMT_OFFSET + 6] << 8 | pkt[XMT_OFFSET + 7];
-  // delay = (T4 - T1) - (T3 - T2)
-  const unsigned long dt32sec = t3sec - t2sec - ((t3p32 < t2p32) ? 1 : 0);
-  const unsigned long dt32p32 = t3p32 - t2p32;
-  const unsigned long dt32millis = dt32sec * 1000 + dt32p32 / 4294967UL; // 2^32 / 1000 ≈ 4294967.296
-  const unsigned long dt41millis = t4millis - t1millis;
-  const unsigned long delayLong = dt41millis - dt32millis;
-  const unsigned int delayMillis = delayLong > MAXDISP_MS ? MAXDISP_MS
-                                   : delayLong == 0       ? 1
-                                                          : delayLong;
-  // offset = ((T2 + T3) - (T1 + T4)) / 2
-  const unsigned msb = sizeof(unsigned long) * 8 - 1;
-  const unsigned long midp23p32 = t2p32 + ((dt32sec & 1) << msb) + dt32p32 / 2;
-  // At most one carry might happen above, e.g. 0xFF + 0x80 + 0x7F -> 0x1FE
-  const unsigned long midp23sec = t2sec + dt32sec / 2 + (midp23p32 < t2p32 ? 1 : 0);
-
-  const unsigned long midp23Unix = midp23sec - JAN_1970;
-  const unsigned long mipd14millis = t1millis + dt41millis / 2 - (midp23p32 / 4294967UL);
-
-  if (_clock.isSet()) {
-    const int offsetMillis = _clock.offset(midp23Unix, mipd14millis);
-    jigglePollInterval(offsetMillis); // When a clock update is received...
-    _lastOffsetMillis = offsetMillis;
+    // Some samples are discarded while, for instance, a direct frequency measurement is being made.
+    case IGNORE:
+      break;
   }
-  // SNTP STEPs on every sample, has no clock discipline and/or frequency adjustments.
-  _clock.set(midp23Unix, mipd14millis);
+}
+#endif
+
+unsigned long NTPClient::nextPollInterval() const {
+  // 1024ms is not exactly 1s, but that's close enough given added jitter
+  // Note, Popcorn Spike Suppressor assumes that that pollIn is an upper bound.
+  unsigned long pollIn = 1UL << (_pollExponent + 10);
+  unsigned long eights = 1UL << (_pollExponent + 7);
+  unsigned long jitter = random() & (eights - 1);
+  return pollIn - eights + jitter;  // pollIn * [7/8...1)
 }
 
-bool NTPClient::isTimeToPoll(void) const {
-  // dtMillis overflows and wraps in ≈49 days, MAXPOLL is 36h, so it should be okay.
-  const unsigned long now = millis();
-  const unsigned long dtMillis = now - _lastPollMillis;
-  const unsigned long pollSeconds = 1UL << _pollExponent;
-  if (dtMillis > (pollSeconds << 10)) // rough estimate avoiding MUL
-    return true;
-  const unsigned long updateInterval = pollSeconds * 1000UL; // precise one
-  return dtMillis > updateInterval;
+void NTPClient::scheduleNextPoll() {
+  _nextPollMillis = millis() + nextPollInterval();
+  _waitingForReply = false;
 }
 
 bool NTPClient::update() {
-  if (!(_flags & _firstPollDone) || isTimeToPoll())
-    return forceUpdate();
-  return false;
+  bool last;
+  do {
+    last = maintain();
+  } while (_waitingForReply);
+  return last;
 }
 
 bool NTPClient::isTimeSet() const {
-  return _clock.isSet();
+  return _clockState != NCLK;
 }
 
-unsigned long NTPClient::getEpochTime(unsigned long *pMillis) const {
-  return _QHourOffset * 900 + _clock.getEpochTime(pMillis);
+bool NTPClient::isTimeSync() const {
+  return _clockState == SYNC;
+}
+
+bool NTPClient::getTimeOfDay(NTPTimeval *tv) const {
+  if (!isTimeSet())
+    return false;
+  const uint64_t sinceMicros = micros63() - _lastMicros;
+  tv->tv_usec = sinceMicros % 1000000;
+  const uint64_t sinceSec = (sinceMicros - tv->tv_usec) / 1000000;
+  tv->tv_sec = _lastUnix + sinceSec;
+  return true;
+}
+
+int64_t NTPClient::freqErr(int64_t dtMicros) const {
+  if (_clockState < FSET)
+    return 0;
+  const int64_t err = dtMicros * _freq;
+  return err;
+}
+
+uint64_t NTPClient::unixLFPAt(uint64_t micros) const {
+  // ASSUME(_lastMicros <= micros);
+  const int64_t sinceMicrosRaw = micros - _lastMicros;
+  const int64_t sinceMicros = sinceMicrosRaw + freqErr(sinceMicrosRaw);
+  const uint32_t sinceSec = sinceMicros / 1000000;
+  const uint32_t sinceLfplo = us2lfplo(sinceMicros % 1000000);
+  const uint32_t sinceLfphi = _lastUnix + sinceSec;
+  const uint64_t since = (uint64_t(sinceLfphi) << 32) | sinceLfplo;
+  return since;
+}
+
+unsigned long NTPClient::getEpochTime() const {
+  const int64_t sinceMicrosRaw = micros63() - _lastMicros;
+  const int64_t sinceMicros = sinceMicrosRaw + freqErr(sinceMicrosRaw);
+  const uint32_t sinceSec = sinceMicros / 1000000;
+  return _timeOffset + _lastUnix + sinceSec;
 }
 
 int NTPClient::getDay() const {
@@ -402,52 +1075,51 @@ String NTPClient::getFormattedTime() const {
 }
 
 void NTPClient::end() {
-  _udp->stop();
-  _flags &= ~_udpSetup;
-  if (!(_flags & _confSrcPort))
-    _srcPort = 0;
+  if (this->_udpSetup)
+    this->_udp.stop();
+  this->_udpSetup = false;
 }
 
 void NTPClient::setTimeOffset(int timeOffset) {
-  _QHourOffset = secondsToQHour(timeOffset);
+  this->_timeOffset     = timeOffset;
 }
 
 void NTPClient::setUpdateInterval(unsigned long updateInterval) {
-  _pollExponent = ntppoolExponent(millisecondsToPollExponent(updateInterval));
+  this->_pollExponent   = millisToPollExponent(updateInterval);
+  if (isPollingNtppool())
+    this->_pollExponent = max(_pollExponent, NTPPOOL_MINPOLL);
 }
 
-void NTPClient::setPoolServerName(const char* serverName) {
-  _serverName = serverName;
-  _serverIP = INADDR_ANY;
-  // TODO: keep `updateInterval` if it was set in ctor
-  resetNtpPoll(ntppoolExponent(DEFPOLL));
+void NTPClient::setPoolServerName(const char* poolServerName) {
+    this->_poolServerName = poolServerName;
+    this->_doResolve = true;
+    if (isPollingNtppool())
+      this->_pollExponent = max(_pollExponent, NTPPOOL_MINPOLL);
 }
 
-unsigned long NTPClient::sendNTPPacket(const unsigned char xmt[8]) {
-  // Values are set per https://datatracker.ietf.org/doc/html/draft-ietf-ntp-data-minimization-04
-  unsigned char pkt[NTP_PACKET_SIZE];
-  pkt[0] = 0x23;          // (LI = 0, VN = 4, Mode = 3).
-  pkt[1] = 0;             // Stratum = 0
-  pkt[2] = _pollExponent; // Polling Interval
-  pkt[3] = 0x20;          // Peer Clock Precision = 136 years
-  // XXX: Should I save 36 bytes of stack and call _udp->write(0) byte-by-byte?
+void NTPClient::sendNTPPacket(const unsigned char xmt[8]) {
+  // TODO: sendNTPPacket() deserves some error checking
+  if  (_doResolve) {
+    this->_udp.beginPacket(this->_poolServerName, PORT);
+  } else {
+    this->_udp.beginPacket(this->_poolServerIP, PORT);
+  }
+  // Values are picked per NTP Client Data Minimization draft:
+  // https://datatracker.ietf.org/doc/html/draft-ietf-ntp-data-minimization-04
+  uint8_t pkt[NTP_PACKET_SIZE];
+  pkt[0] = 0x23;  // (LI = 0, VN = 4, Mode = 3).
+  pkt[1] = 0;     // Stratum = 0
+  pkt[2] = _pollExponent;
+  pkt[3] = 0x20;  // Clock Precision = 136 years
   memset(pkt + 4, 0, NTP_PACKET_SIZE - 4 - 8);
-  memcpy(pkt + 40, xmt, 8); // Transmit Timestamp field SHOULD be random
-
-  // Use cached _serverIP value if it's a valid one, however, the cached value is updated later,
-  // as _udp->remoteIP() "must be called after WiFiUDP.parsePacket()".
-  if (INADDR_ANY == _serverIP || _serverName && (_flags & _tryDNS))
-    _udp->beginPacket(_serverName, PORT);
-  else
-    _udp->beginPacket(_serverIP, PORT);
-
-  const unsigned long t1 = millis();
-  _udp->write(pkt, NTP_PACKET_SIZE);
-  _udp->endPacket();
-  return t1;
+  memcpy(pkt + XMT_OFFSET, xmt, 8);  // Transmit Timestamp field SHOULD be random
+  this->_udp.write(pkt, NTP_PACKET_SIZE);
+  _t1 = micros();
+  this->_udp.endPacket();
 }
 
 void NTPClient::setRandomPort(unsigned int minValue, unsigned int maxValue) {
-  _flags |= _confSrcPort;
-  _srcPort = random(minValue, maxValue);
+  this->_port = random(minValue, maxValue + 1);
+  this->_keepPortOnNewIP = true;
+  end();
 }
