@@ -2,15 +2,26 @@
 
 #include <Arduino.h>
 #include <Udp.h>
+#include <float.h>
 
 /* That's SNTPv4 client supporting the following features:
  *  - NTP Client Data Minimization per draft-ietf-ntp-data-minimization-04
  *  - Port randomization per RFC 6056 and RFC 9109
  *  - MINPOLL of 11 (30 minutes) for ntppool per https://www.ntppool.org/tos.html
  *  - Server IP caching to reduce jitter and measure true NTP Delay (T4-T1) without DNS query RTT
- *  - Incoming packet validation (NTPClient-3.2.1 did not validate input)
+ *  - Incoming packet validation, NTPClient-3.2.1 did not validate input
  *  - Non-blocking network operation without delay() calls
  *  - Sub-second precision to make Arduino-based clocks "tick" synchronously
+ *  - Optional clock state reporting via syslog protocol
+ *
+ * It does not support:
+ *  - several time sources
+ *  - huff-n'-puff filter for links with highly asymmetric delays
+ *
+ * Conditional compilation options:
+ *  NTPCLIENT_MAXFREQ - defaults to 500 (ppm), adjust it for badly clocked boards (w/o guarantees)
+ *  NTPCLIENT_SYSLOG  - IPv4 address of syslog server to get debugging messages as 32-bit inaddr_t
+ *  NTPCLIENT_WANDER  - define to enable clock wander calculation
  */
 
 // Some platforms (e.g. ESP32) have sys/time.h and struct timeval, and some don't (e.g. ATmega328).
@@ -24,6 +35,10 @@ struct NTPTimeval {
 };
 #endif
 
+#ifndef NTPCLIENT_MAXFREQ
+#define NTPCLIENT_MAXFREQ 500  // frequency tolerance (500 ppm)
+#endif
+
 class NTPClient {
   private:
     static const unsigned NSTAGE = 8; // clock register stages
@@ -35,29 +50,35 @@ class NTPClient {
     long          _timeOffset     = 0;
 
     // _lastMicros corrsespong to _lastUnix.00000000, not to _lastUnix._lastUnixLFP16
-    // _lastUnixLFP16 is used for extra precision in `mu` calculation.
+    // _lastUnixLFP16 is used for extra precision in `mu` calculation and nothing else.
     int64_t       _lastMicros;
     uint32_t      _lastUnix;
     uint16_t      _lastUnixLFP16;
     double        _lastOffset;
     double        _clockJitter;
     double        _freq;
-#ifdef NTPCLIENT_SYSLOG
+#ifdef NTPCLIENT_WANDER
     double        _wander;
+#endif
+#ifdef NTPCLIENT_SYSLOG
+    unsigned long _pid;
+    static uint32_t sequenceId;
 #endif
     int8_t        _jiggleCount;
     uint8_t       _reach;
 
     struct Sample {
-      uint32_t unixHigh;       // It does not matter much if it's NTP or Unix. That's unix.
+      uint32_t unixHigh;       // It does not matter much if it's NTP or Unix. This one is Unix.
       uint16_t unixLFP16;      // 16 high bits of 32-bit LFP. That's fine given S_PRECISION.
       uint16_t delayMicros16;  // This machine speaks micros(), that's count of 32us steps.
       double   offset;         // Offsets beyond ±125ms (STEPT) are either IGNORE'd or lead to STEP.
+
+      uint32_t distance(uint32_t unixNow) const;
     };
     Sample        _filter[NSTAGE];
 
     union {
-      uint16_t      _xmt16[4];        // not T1, but a random cookie
+      uint32_t      _xmt[2];          // not T1, but a random cookie
       unsigned long _nextPollMillis;  // invalid while _waitingForReply
     };
     unsigned long _t1;
@@ -79,7 +100,7 @@ class NTPClient {
     void          sendNTPPacket(const unsigned char xmt[8]);
     bool          isPollingNtppool(void) const;
     unsigned char minpoll(void) const;
-    const Sample* bestSample(void) const;
+    const Sample* bestSample(uint32_t unixNow) const;
     double        peerJitter(const Sample* best) const;
     uint64_t      unixLFPAt(uint64_t micros) const;
     int64_t       freqErr(int64_t micros) const;
@@ -153,12 +174,17 @@ class NTPClient {
     double getClockJitter(void) const {
       return _clockJitter;
     }
+    void setClockFreq(double freq) {
+      _freq = freq;
+    }
     double getClockFreq(void) const {
       return _freq;
     }
+#ifdef NTPCLIENT_WANDER
     double getClockWander(void) const {
       return _wander;
     }
+#endif
 
     int getDay() const;
     int getHours() const;
